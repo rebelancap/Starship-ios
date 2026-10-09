@@ -40,7 +40,7 @@ uniformity.
  endif()
  
  ################################################################################
-@@ -166,22 +167,119 @@
+@@ -166,22 +167,145 @@
  list(FILTER ALL_FILES EXCLUDE REGEX "src/mods/object_ram.c")
  
  if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -133,10 +133,36 @@ uniformity.
 +    set(SOH_IOS_BUNDLE_IDENTIFIER "com.harbourmasters.starship" CACHE STRING "iOS bundle identifier")
 +    set(SOH_IOS_DEVELOPMENT_TEAM "" CACHE STRING "Development team for iOS code signing")
 +    # SOH_IOS (overlay 0012): visionOS's SwiftUI ImmersiveSpace requires
-+    # UIApplicationSceneManifest with multiple scenes. This key changes UIKit
-+    # scene behavior on iPhone, so it is visionOS-only (@SOH_PLIST_EXTRA@ in
++    # UIApplicationSceneManifest with multiple scenes; the SOH_VISIONOS branch
++    # below overwrites SOH_PLIST_EXTRA wholesale with that (@SOH_PLIST_EXTRA@ in
 +    # Info.plist.in). Must be INSIDE the manifest dict — top-level is ignored.
-+    set(SOH_PLIST_EXTRA "")
++    # iOS (D22, = Shipwright c8de40b): the iOS 27 SDK HARD-REQUIRES the UIScene
++    # life cycle -- a UIKit app built against it with no scene manifest is
++    # killed before main() (SIGTRAP in
++    # ___UIApplicationEvaluateRuntimeIssueForNoSceneLifecycleAdoption). One
++    # window scene, delegate SohIosSceneDelegate (app/ios/SohIosShell.m, which
++    # also grafts the app-delegate scene-config hook onto SDLUIKitDelegate at
++    # +load: the runtime wants BOTH, a manifest alone still traps).
++    set(SOH_PLIST_EXTRA
++"	<key>UIApplicationSceneManifest</key>
++	<dict>
++		<key>UIApplicationSupportsMultipleScenes</key>
++		<false/>
++		<key>UISceneConfigurations</key>
++		<dict>
++			<key>UIWindowSceneSessionRoleApplication</key>
++			<array>
++				<dict>
++					<key>UISceneConfigurationName</key>
++					<string>Default</string>
++					<key>UISceneDelegateClassName</key>
++					<string>SohIosSceneDelegate</string>
++					<key>UISceneClassName</key>
++					<string>UIWindowScene</string>
++				</dict>
++			</array>
++		</dict>
++	</dict>")
 +    if(SOH_VISIONOS)
 +        set(SOH_PLIST_EXTRA
 +"	<key>UIApplicationSceneManifest</key>
@@ -171,10 +197,11 @@ uniformity.
      )
  else()
      add_executable(${PROJECT_NAME} ${ALL_FILES})
-@@ -355,6 +453,44 @@
+@@ -354,6 +478,44 @@
+     )
      target_include_directories(${PROJECT_NAME} PRIVATE
          ${DEVKITPRO}/portlibs/wiiu/include/
-     )
++    )
 +elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    # Prebuilt static ogg/vorbis for iOS (scripts/build-audio-deps-ios.sh),
 +    # injected by prefix. SDL2 comes statically from LUS's FetchContent
@@ -212,11 +239,10 @@ uniformity.
 +        "Vorbis::vorbisfile"
 +        ${CMAKE_DL_LIBS}
 +        Threads::Threads
-+    )
+     )
  else()
      find_package(Ogg REQUIRED)
-     find_package(Vorbis REQUIRED)
-@@ -384,6 +520,11 @@
+@@ -384,6 +546,11 @@
  option(BUILD_MK64 "Build with Mario Kart 64 support" OFF)
  option(BUILD_FZERO "Build with F-Zero X support" OFF)
  add_subdirectory(tools/Torch)
@@ -250,7 +276,7 @@ uniformity.
 +	<key>CFBundlePackageType</key>
 +	<string>APPL</string>
 +	<key>CFBundleShortVersionString</key>
-+	<string>1.0.1</string>
++	<string>1.0.2</string>
 +	<key>CFBundleVersion</key>
 +	<string>@SOH_IOS_BUNDLE_VERSION@</string>
 +	<key>LSRequiresIPhoneOS</key>

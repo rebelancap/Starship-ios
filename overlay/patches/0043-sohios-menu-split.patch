@@ -1,0 +1,345 @@
+Overlay patch 0043 (D27): MENU-PHASE SPLIT. Port of Shipwright-ios 0068
+(D-087) to Starship's LUS (here the whole ImGui frame lives in
+src/window/gui/Gui.cpp; there is no Fast3dGui yet).
+
+WHY. On SoH the remaining phone spikes after the depth fix sat in 0066's
+`menu` phase, and this split traced them to LUS's invisible
+SDLAddRemoveDeviceEventHandler GuiWindow: its UpdateElement() calls
+SDL_PumpEvents() every frame, which on iOS runs the main CFRunLoop -- every
+UIKit callback, the touch overlay's full-screen Core Graphics repaint and the
+CA commit -- INSIDE Gui::DrawMenu. Starship's LUS has the same window
+(controller/physicaldevice/SDLAddRemoveDeviceEventHandler.cpp), so the same
+instrument ships here.
+
+WHAT. Ten marks per 2D frame, P..I, all inside Gui::StartDraw:
+  P/A  around the Metal backend NewFrame   (fb  = drawable acquired -> A)
+  B    after ImGui_ImplSDL2_NewFrame        (sdl)
+  C    DrawMenu entry                       (new = ImGui::NewFrame)
+  D    before the menu bar                  (dock = Main-Deck dockspace/keys)
+  E    after the menu bar                   (bar)
+  F    after the menu                       (menu)
+  G    DrawMenu returned                    (win = GuiWindows + ImGui::End)
+  H    = G (a mark before ImGui::End would break 0037's context; end ~0)
+  I    CalculateGameViewport returned       (vp)
+Each sub-bucket gets wall and thread-CPU time; every GuiWindow is timed by
+name. SOH_MSLOW per slow frame (>= 4 ms, max 20 per 10 s), SOH_MENUWIN per
+10 s. Gated by gSohIos.SpikeProbe (0042); out-of-order marks void a frame;
+3D (visionOS immersive) frames are skipped.
+
+Code: new file src/port/SohIosMenuSplit.cpp (source of truth:
+overlay/assets/probe/). Generate against 0001..0042 applied.
+
+--- /dev/null
++++ b/src/port/SohIosMenuSplit.cpp
+@@ -0,0 +1,207 @@
++// SOH_IOS (overlay 0043, D27): MENU-PHASE SPLIT. Port of Shipwright 0068
++// (D-087) -- see the patch header. Game thread only. Gated by 0042's
++// gSohIosSpkOn (gSohIos.SpikeProbe).
++#ifdef __IOS__
++#include "SohIosPace.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <mach/mach_time.h>
++#include <time.h>
++#include <libultraship.h>
++#include <spdlog/spdlog.h>
++
++extern "C" volatile int gSohIosSpkOn;
++
++namespace SohIosMenu {
++using SohIosPace::Clock;
++using SohIosPace::Ms;
++enum { NMARK = 10 };
++enum { M_FB, M_SDL, M_NEW, M_DOCK, M_BAR, M_MENU, M_WIN, M_END, M_VP, NSUB };
++static const char* const kSub[NSUB] = { "fb", "sdl", "new", "dock", "bar", "menu", "win", "end", "vp" };
++static Clock::time_point sT[NMARK];
++static unsigned long long sC[NMARK];
++static int sNext = 0; // next expected mark; 0 = waiting for P
++struct WinAcc {
++    const char* name;
++    double ms;
++    double maxMs;
++};
++struct Win {
++    unsigned frames, slow, logged;
++    double wall, wallSlow, wallMax, cpu, cpuSlow;
++    double sub[NSUB], subSlow[NSUB], subMax[NSUB];
++    unsigned topCount[NSUB];
++    WinAcc win[64];
++    int nwin;
++    Clock::time_point start;
++};
++static Win sW{};
++static const char* sTopWin = nullptr;
++static double sTopWinMs = 0.0;
++
++static double TickMs() {
++    static const double v = [] {
++        mach_timebase_info_data_t tb;
++        mach_timebase_info(&tb);
++        return (double)tb.numer / (double)tb.denom / 1e6;
++    }();
++    return v;
++}
++
++static void Report(Clock::time_point now) {
++    Win& w = sW;
++    if (w.frames > 0) {
++        static char buf[2048];
++        size_t k = 0;
++        auto ap = [&](const char* fmt, auto... a) {
++            if (k < sizeof(buf) - 1) {
++                int n = snprintf(buf + k, sizeof(buf) - k, fmt, a...);
++                if (n > 0) {
++                    k = std::min(sizeof(buf) - 1, k + (size_t)n);
++                }
++            }
++        };
++        double sl = w.slow ? (double)w.slow : 1.0;
++        ap("SOH_MENUWIN el=%.1f frames=%u slow=%u wall avg=%.2f slow=%.2f max=%.2f cpu avg=%.2f slow=%.2f |"
++           " sub all/slow/max:",
++           Ms(w.start, now) / 1000.0, w.frames, w.slow, w.wall / w.frames, w.wallSlow / sl, w.wallMax,
++           w.cpu / w.frames, w.cpuSlow / sl);
++        for (int s = 0; s < NSUB; s++) {
++            ap(" %s=%.2f/%.2f/%.1f", kSub[s], w.sub[s] / w.frames, w.subSlow[s] / sl, w.subMax[s]);
++        }
++        ap(" | slow_top:");
++        for (int s = 0; s < NSUB; s++) {
++            if (w.topCount[s] != 0) {
++                ap(" %s=%u", kSub[s], w.topCount[s]);
++            }
++        }
++        ap(" | wins:");
++        for (int r = 0; r < 4; r++) {
++            int best = -1;
++            for (int i = 0; i < w.nwin; i++) {
++                if (w.win[i].ms >= 0.0 && (best < 0 || w.win[i].ms > w.win[best].ms)) {
++                    best = i;
++                }
++            }
++            if (best < 0 || w.win[best].ms <= 0.0) {
++                break;
++            }
++            ap(" %s=%.1f/%.2f", w.win[best].name, w.win[best].ms, w.win[best].maxMs);
++            w.win[best].ms = -1.0; // consumed (the window is reset below)
++        }
++        SPDLOG_INFO("{}", buf);
++    }
++    sW = Win{};
++    sW.start = now;
++}
++
++static void Finish() {
++    Clock::time_point de = SohIosPace::gDrawEnd;
++    double sub[NSUB], cpu[NSUB];
++    sub[M_FB] = (de <= sT[1] && Ms(de, sT[1]) < 1000.0) ? Ms(de, sT[1]) : 0.0;
++    cpu[M_FB] = (sC[1] - sC[0]) / 1e6;
++    for (int s = 1; s < NSUB; s++) {
++        sub[s] = Ms(sT[s], sT[s + 1]);
++        cpu[s] = (sC[s + 1] - sC[s]) / 1e6;
++    }
++    double wall = 0.0, tcpu = 0.0;
++    int top = 0;
++    for (int s = 0; s < NSUB; s++) {
++        wall += sub[s];
++        tcpu += cpu[s];
++        if (sub[s] > sub[top]) {
++            top = s;
++        }
++    }
++    Win& w = sW;
++    if (w.start.time_since_epoch().count() == 0) {
++        w.start = sT[9];
++    }
++    bool slow = wall >= 4.0;
++    w.frames++;
++    w.wall += wall;
++    w.cpu += tcpu;
++    w.wallMax = std::max(w.wallMax, wall);
++    for (int s = 0; s < NSUB; s++) {
++        w.sub[s] += sub[s];
++        w.subMax[s] = std::max(w.subMax[s], sub[s]);
++        if (slow) {
++            w.subSlow[s] += sub[s];
++        }
++    }
++    if (slow) {
++        w.slow++;
++        w.wallSlow += wall;
++        w.cpuSlow += tcpu;
++        w.topCount[top]++;
++        if (w.logged < 20) {
++            w.logged++;
++            static char buf[768];
++            size_t k = 0;
++            int n = snprintf(buf, sizeof(buf), "SOH_MSLOW wall=%.2f cpu=%.2f top=%s |", wall, tcpu, kSub[top]);
++            k = n > 0 ? std::min(sizeof(buf) - 1, (size_t)n) : 0;
++            for (int s = 0; s < NSUB && k < sizeof(buf) - 1; s++) {
++                n = snprintf(buf + k, sizeof(buf) - k, " %s=%.2f/%.2f", kSub[s], sub[s], cpu[s]);
++                k = n > 0 ? std::min(sizeof(buf) - 1, k + (size_t)n) : k;
++            }
++            if (k < sizeof(buf) - 1) {
++                snprintf(buf + k, sizeof(buf) - k, " | win_top=%s:%.2f", sTopWin ? sTopWin : "-", sTopWinMs);
++            }
++            SPDLOG_INFO("{}", buf);
++        }
++    }
++    if (Ms(w.start, sT[9]) >= 10000.0) {
++        Report(sT[9]);
++    }
++}
++} // namespace SohIosMenu
++
++// 0 P .. 9 I (see the patch header). Out-of-order marks void the frame.
++extern "C" void SohIos_MenuMark(int which) {
++    using namespace SohIosMenu;
++    if (!gSohIosSpkOn || gSoh3DMode != 0 || which < 0 || which >= NMARK) {
++        sNext = 0;
++        return;
++    }
++    if (which == 0) {
++        sNext = 0;
++        sTopWin = nullptr;
++        sTopWinMs = 0.0;
++    } else if (which != sNext) {
++        sNext = 0;
++        return;
++    }
++    sT[which] = Clock::now();
++    sC[which] = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
++    sNext = which + 1;
++    if (which == NMARK - 1) {
++        sNext = 0;
++        Finish();
++    }
++}
++
++// One GuiWindow's Update + Draw (t0 from SohIos_SpkNow; 0 = probe off).
++extern "C" void SohIos_MenuWin(const char* name, unsigned long long t0) {
++    using namespace SohIosMenu;
++    if (t0 == 0ull || name == nullptr || sNext == 0) {
++        return;
++    }
++    double ms = (mach_absolute_time() - t0) * TickMs();
++    if (ms > sTopWinMs) {
++        sTopWinMs = ms;
++        sTopWin = name;
++    }
++    Win& w = sW;
++    for (int i = 0; i < w.nwin; i++) {
++        if (w.win[i].name == name) {
++            w.win[i].ms += ms;
++            w.win[i].maxMs = std::max(w.win[i].maxMs, ms);
++            return;
++        }
++    }
++    if (w.nwin < 64) {
++        w.win[w.nwin++] = WinAcc{ name, ms, ms };
++    }
++}
++#endif
+--- a/libultraship/src/window/gui/Gui.cpp
++++ b/libultraship/src/window/gui/Gui.cpp
+@@ -349,6 +349,13 @@
+     return windowID;
+ }
+ 
++#ifdef __IOS__
++// SOH_IOS (overlay 0043, D27): menu-phase split marks (src/port/SohIosMenuSplit.cpp).
++extern "C" void SohIos_MenuMark(int which);
++extern "C" void SohIos_MenuWin(const char* name, unsigned long long t0);
++extern "C" unsigned long long SohIos_SpkNow(void);
++#endif
++
+ void Gui::ImGuiBackendNewFrame() {
+     switch (Context::GetInstance()->GetWindow()->GetWindowBackend()) {
+ #ifdef ENABLE_OPENGL
+@@ -367,7 +374,13 @@
+         case WindowBackend::FAST3D_SDL_METAL: {
+             Fast::GfxRenderingAPIMetal* api =
+                 (Fast::GfxRenderingAPIMetal*)mInterpreter.lock()->GetCurrentRenderingAPI();
++#ifdef __IOS__
++            SohIos_MenuMark(0); // overlay 0043: P
++#endif
+             api->NewFrame();
++#ifdef __IOS__
++            SohIos_MenuMark(1); // A
++#endif
+             // Metal_NewFrame();
+             break;
+         }
+@@ -382,6 +395,9 @@
+         case WindowBackend::FAST3D_SDL_OPENGL:
+         case WindowBackend::FAST3D_SDL_METAL:
+             ImGui_ImplSDL2_NewFrame();
++#ifdef __IOS__
++            SohIos_MenuMark(2); // overlay 0043: B
++#endif
+             break;
+ #ifdef ENABLE_DX11
+         case WindowBackend::FAST3D_DXGI_DX11:
+@@ -505,6 +521,9 @@
+ void Gui::DrawMenu() {
+     const std::shared_ptr<Window> wnd = Context::GetInstance()->GetWindow();
+     const std::shared_ptr<Config> conf = Context::GetInstance()->GetConfig();
++#ifdef __IOS__
++    SohIos_MenuMark(3); // overlay 0043: C
++#endif
+ 
+     ImGuiWindowFlags windowFlags = ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground |
+                                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+@@ -568,19 +587,34 @@
+             ->Dispatch("reset");
+     }
+ 
++#ifdef __IOS__
++    SohIos_MenuMark(4); // overlay 0043: D
++#endif
+     if (GetMenuBar()) {
+         GetMenuBar()->Update();
+         GetMenuBar()->Draw();
+     }
++#ifdef __IOS__
++    SohIos_MenuMark(5); // E
++#endif
+ 
+     if (GetMenu()) {
+         GetMenu()->Update();
+         GetMenu()->Draw();
+     }
++#ifdef __IOS__
++    SohIos_MenuMark(6); // F
++#endif
+ 
+     for (auto& windowIter : mGuiWindows) {
++#ifdef __IOS__
++        unsigned long long sohWinT0 = SohIos_SpkNow();
++#endif
+         windowIter.second->Update();
+         windowIter.second->Draw();
++#ifdef __IOS__
++        SohIos_MenuWin(windowIter.first.c_str(), sohWinT0);
++#endif
+     }
+ 
+     ImGui::End();
+@@ -845,8 +879,18 @@
+     StartFrame();
+     // Draw the gui menus
+     DrawMenu();
++#ifdef __IOS__
++    // G and H together: a mark between the GuiWindow loop and ImGui::End()
++    // would sit inside 0037's hunk context, so `win` also holds ImGui::End()
++    // and `end` reads ~0 here.
++    SohIos_MenuMark(7); // overlay 0043: G
++    SohIos_MenuMark(8); // H
++#endif
+     // Calculate the available space the game can render to
+     CalculateGameViewport();
++#ifdef __IOS__
++    SohIos_MenuMark(9); // overlay 0043: I
++#endif
+ }
+ 
+ void Gui::EndDraw() {

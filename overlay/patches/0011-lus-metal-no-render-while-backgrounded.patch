@@ -3,9 +3,13 @@ park the game thread before nextDrawable while the shell reports
 backgrounded; retry a briefly-null drawable and skip the frame instead of
 dereferencing null. Disjoint from 0007's RenderDrawData hunk (D6).
 
+D22c (2026-10-08, scripts/gen-patch-0011.py): the park loop calls the
+shell's SohIos_ParkTick() (services the main run loop) instead of
+nanosleep -- a sleeping park on the main thread deadlocked resume.
+
 --- a/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
 +++ b/libultraship/src/graphic/Fast3D/backends/gfx_metal.cpp
-@@ -594,9 +594,37 @@
+@@ -606,9 +606,40 @@
      return (int)index;
  }
  
@@ -13,6 +17,7 @@ dereferencing null. Disjoint from 0007's RenderDrawData hunk (D6).
 +// SOH_IOS (reference overlay 0016): shell-provided background flag (linkage
 +// specs must live at file scope, not inside the function).
 +extern "C" int SohIos_IsBackgrounded(void);
++extern "C" void SohIos_ParkTick(void);
 +#endif
 +
  void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
@@ -22,9 +27,11 @@ dereferencing null. Disjoint from 0007's RenderDrawData hunk (D6).
 +    // background stalls/times out (post-resume slowdown, watchdog risk).
 +    // The process suspends moments later and resumes here.
 +    {
-+        const struct timespec sohIosNap = { 0, 50 * 1000 * 1000 };
++        // ParkTick services the main run loop (the game loop IS the main
++        // thread on iOS) so the lifecycle events that clear the flag can
++        // deliver -- a sleeping park here deadlocks into a black screen.
 +        while (SohIos_IsBackgrounded()) {
-+            nanosleep(&sohIosNap, nullptr);
++            SohIos_ParkTick();
 +        }
 +        const struct timespec sohIosRetryNap = { 0, 10 * 1000 * 1000 };
 +        for (int i = 0; i < 100 && mCurrentDrawable == nullptr; i++) {

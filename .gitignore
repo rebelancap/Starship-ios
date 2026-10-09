@@ -28,3 +28,4 @@
 /build-ios/
 /ota/*/starship.ipa
 build-visionos/
+__pycache__/
