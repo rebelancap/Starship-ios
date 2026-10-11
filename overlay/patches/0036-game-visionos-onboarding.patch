@@ -1,32 +1,59 @@
-Overlay patch 0036: non-blocking onboarding prompts on visionOS.
-The extractor's first prompt (Engine.cpp ShowYesNoBox "Please provide a ROM")
-and its error boxes (ShowMessage) are SDL message boxes. On visionOS an SDL
-message box cannot composite (it hangs the engine-thread nested runloop that
-drives it -> black screen on fresh install, BEFORE the ROM picker is ever
-reached). On visionOS: ShowYesNoBox returns IDYES immediately (proceed straight
-to the SwiftUI ROM picker, SohIos_PickRomBlocking), and ShowMessage logs only.
-TARGET_OS_VISION-guarded; iOS/desktop unchanged. Needs <TargetConditionals.h>
-for the macro (added guarded).
+Overlay patch 0036: first-run onboarding prompts that actually appear.
+
+The extractor's first prompt (Engine.cpp ShowYesNoBox "Please provide a ROM
+/ extract into an O2R") and its error boxes (ShowMessage) are SDL message
+boxes. Two platforms cannot use that:
+
+- visionOS: an SDL message box cannot composite (it hangs the engine-thread
+  nested runloop -> black screen). ShowYesNoBox returns IDYES immediately
+  (straight to the SwiftUI ROM picker) and ShowMessage logs only.
+- iOS, including LiveContainer: SDL builds the alert's UIWindow from
+  UIScreen bounds and never sets windowScene. After the iOS 27 scene
+  adoption that window is not on screen, so a fresh install blocks forever
+  on a black screen and the O2R prompt never appears. LiveContainer only
+  auto-attaches scene-less windows for apps that have NOT adopted scenes.
+  ShowYesNoBox / ShowMessage call SohIos_AlertBlocking (shell) instead.
+
+Desktop/oracle keep SDL. Needs <TargetConditionals.h> (added here).
+
+Generate against a vendor tree with 0036 NOT applied (reverse it first).
+The iOS branch lives in THIS patch, not a later one: a follow-on patch that
+edits these same lines breaks apply-overlay's already-applied probe.
+
 
 --- a/src/port/Engine.cpp
 +++ b/src/port/Engine.cpp
-@@ -780,8 +780,15 @@
+@@ -813,9 +813,29 @@
  	return GameEngine::GetInterpolationFrameCount();
  }
  
 +#include <TargetConditionals.h> // SOH_IOS (overlay 0036): TARGET_OS_VISION
++#if defined(__IOS__)
++// SOH_IOS (overlay 0036): scene-attached first-run alert. SDL's message-box
++// window has no windowScene, so after the iOS 27 scene adoption it never
++// appears (black screen, no O2R prompt) on a normal install and inside
++// LiveContainer. cancelTitle == NULL is a single button; 1 = accept, 0 = cancel.
++extern "C" int SohIos_AlertBlocking(const char* title, const char* message, const char* acceptTitle,
++                                    const char* cancelTitle);
++#endif
  void GameEngine::ShowMessage(const char* title, const char* message, SDL_MessageBoxFlags type) {
  #if defined(__SWITCH__)
-+    SPDLOG_ERROR(message);
+     SPDLOG_ERROR(message);
 +#elif TARGET_OS_VISION
 +    // SOH_IOS (overlay 0036): an SDL message box can't composite on visionOS
 +    // (it hangs the engine-thread runloop -> black screen). Log only.
 +    (void)title;
 +    (void)type;
-     SPDLOG_ERROR(message);
++    SPDLOG_ERROR(message);
++#elif defined(__IOS__)
++    // SOH_IOS (overlay 0036): see SohIos_AlertBlocking.
++    (void)type;
++    SohIos_AlertBlocking(title, message, "OK", nullptr);
++    SPDLOG_ERROR(message);
  #else
      SDL_ShowSimpleMessageBox(type, title, message, nullptr);
-@@ -791,7 +798,14 @@
+     SPDLOG_ERROR(message);
+@@ -824,11 +844,22 @@
  
  int GameEngine::ShowYesNoBox(const char* title, const char* box) {
      int ret;
@@ -42,3 +69,11 @@ for the macro (added guarded).
      ret = MessageBoxA(nullptr, box, title, MB_YESNO | MB_ICONQUESTION);
  #elif defined(__SWITCH__)
      SPDLOG_ERROR(box);
+     return IDYES;
++#elif defined(__IOS__)
++    // SOH_IOS (overlay 0036): see SohIos_AlertBlocking. Yes -> IDYES.
++    (void)ret;
++    return SohIos_AlertBlocking(title, box, "Yes", "No") ? IDYES : IDNO;
+ #else
+     SDL_MessageBoxData boxData = { 0 };
+     SDL_MessageBoxButtonData buttons[2] = { { 0 } };

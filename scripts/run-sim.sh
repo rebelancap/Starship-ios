@@ -6,7 +6,9 @@ APP="$ROOT/spikes/starship-sim-build/Release-iphonesimulator/Starship.app"
 BUNDLE_ID="com.harbourmasters.starship"
 SF64="$ROOT/oracle/shiphome/sf64.o2r"
 SHOT="${1:-sim-boot}"
-UDID="2C540E4A-80FA-48CC-8C13-4EED7D327A43"
+SIM_NAME="${STARSHIP_SIM_NAME:-iPhone Air}"
+UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; n=sys.argv[1]; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for k,v in d.items() if 'iOS-27-0' in k for x in v if x['name']==n))" "$SIM_NAME")
+[[ -n "$UDID" ]] || { echo "FATAL: no available '$SIM_NAME' on iOS 27.0 (ask the user; never simctl create)" >&2; exit 1; }
 
 [[ -d "$APP" ]] || { echo "FATAL: no sim app at $APP — run scripts/build-sim.sh" >&2; exit 1; }
 

@@ -744,11 +744,13 @@ static BOOL SohIos_DocumentsHasExt(NSArray<NSString*>* exts) {
 
 // BLOCKING native ROM picker, called by the game (overlay 0015 rev2) from
 // GameExtractor::SelectGameFromUI when the Documents scan finds no supported
-// .z64. Starship's whole extraction flow runs PRE-SDL-WINDOW (SDL message
-// boxes spin their own runloop on a temporary alert-level window), so this
-// picker does exactly the same: temp UIWindow + UIDocumentPicker + nested
-// runloop until picked/cancelled. Returns 1 if a .z64 was copied into
-// Documents (original filename, NSFileProtectionNone + 0644 — spec 0.5).
+// .z64. Starship's whole extraction flow runs PRE-SDL-WINDOW, so this picker
+// spins its own runloop. The window comes from SohIos_MakeOnboardingWindow
+// (scene-attached, fitted) — a UIScreen-bounds window with no scene is
+// invisible after the iOS 27 scene adoption (D31). Returns 1 if a .z64 was
+// copied into Documents (original filename, NSFileProtectionNone + 0644).
+static UIWindow* SohIos_MakeOnboardingWindow(void);
+static void SohIos_FitModalWindow(UIWindow* window, const char* why);
 @interface SohIosRomPickDelegate : NSObject <UIDocumentPickerDelegate>
 @property(nonatomic) BOOL done;
 @property(nonatomic) BOOL picked;
@@ -818,20 +820,10 @@ int SohIos_PickRomBlocking(void) {
     NSLog(@"[SohIosShell] visionOS ROM import timed out");
     return 0;
 #else
-    // iOS: temp window at alert level (the SDL messagebox pattern — there is no
-    // SDL window yet at this point in boot).
-    UIWindow* w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    for (UIScene* s in UIApplication.sharedApplication.connectedScenes) {
-        if ([s isKindOfClass:UIWindowScene.class]) {
-            w.windowScene = (UIWindowScene*)s;
-            break;
-        }
-    }
-    w.rootViewController = [UIViewController new];
-    w.windowLevel = UIWindowLevelAlert;
-    [w makeKeyAndVisible];
+    UIWindow* w = SohIos_MakeOnboardingWindow();
     [w.rootViewController presentViewController:picker animated:YES completion:nil];
     while (!d.done) {
+        SohIos_FitModalWindow(w, "picker");
         [NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
     }
     w.hidden = YES;
@@ -3153,6 +3145,155 @@ static UIWindowScene* SohIos_ActiveScene(void) {
         fallback = (UIWindowScene*)s;
     }
     return fallback;
+}
+
+// D31: the first-run O2R prompt runs before SDL has a window. SDL's message
+// box builds a UIWindow from UIScreen bounds and never sets windowScene, so
+// once the app adopts scenes (iOS 27 SDK, D22) that window is not on screen.
+// LiveContainer makes the same miss permanent: it only auto-attaches
+// scene-less windows for apps whose delegate has NOT adopted scenes, and
+// this app has. Present on the connected scene, sized to the scene's bounds
+// (a portrait-sized window on a landscape scene clips the alert off to the
+// corner — SpaghettiKart D18). A portrait scene is asked to rotate, then we
+// present into whatever bounds it actually has.
+static BOOL SohIos_SceneIsLandscape(UIWindowScene* scene) {
+    if (scene == nil) {
+        return NO;
+    }
+    CGSize s = scene.coordinateSpace.bounds.size;
+    return s.width > s.height + 1.0;
+}
+
+static void SohIos_FitModalWindow(UIWindow* window, const char* why) {
+    if (window == nil) {
+        return;
+    }
+    UIWindowScene* scene = window.windowScene ?: SohIos_ActiveScene();
+    if (scene == nil) {
+        return;
+    }
+    if (window.windowScene != scene) {
+        window.windowScene = scene;
+    }
+    CGRect sb = scene.coordinateSpace.bounds;
+    if (sb.size.width < 2 || sb.size.height < 2) {
+        return;
+    }
+    UIView* root = window.rootViewController.view;
+    BOOL stale = !CGRectEqualToRect(window.frame, sb) ||
+                 (root != nil && !CGSizeEqualToSize(root.bounds.size, window.bounds.size));
+    if (!stale) {
+        return;
+    }
+    NSLog(@"[SohIosShell] onboarding fit (%s): window %.0fx%.0f -> scene %.0fx%.0f orient %ld", why,
+          window.frame.size.width, window.frame.size.height, sb.size.width, sb.size.height,
+          (long)scene.interfaceOrientation);
+    window.frame = sb;
+    if (root != nil) {
+        root.frame = window.bounds;
+        [root setNeedsLayout];
+        [root layoutIfNeeded];
+    }
+}
+
+static UIWindow* SohIos_MakeOnboardingWindow(void) {
+    UIWindowScene* scene = nil;
+    for (int i = 0; i < 30 && scene == nil; i++) {
+        scene = SohIos_ActiveScene();
+        if (scene != nil) {
+            break;
+        }
+        [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+    UIWindow* w = nil;
+    if (scene != nil) {
+        w = [[UIWindow alloc] initWithWindowScene:scene];
+    }
+    if (w == nil) {
+#if TARGET_OS_VISION
+        // UIScreen does not exist on visionOS. The first-run prompts do not
+        // use this window there; a missing scene has nothing to present on.
+        NSLog(@"[SohIosShell] onboarding: no window scene after 3s");
+        return nil;
+#else
+        w = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        NSLog(@"[SohIosShell] onboarding: no window scene after 3s; alert window is scene-less");
+#endif
+    }
+    w.rootViewController = [UIViewController new];
+    // Above every window already in the scene. UIWindowLevelAlert is enough
+    // for a normal install (the SDL launch window is Normal+1) but inside
+    // LiveContainer the host's own windows can sit higher — its alerts use
+    // lastWindow.windowLevel+1 for the same reason. A prompt under that
+    // chrome is the black screen again.
+    CGFloat level = UIWindowLevelAlert;
+    for (UIWindow* other in UIApplication.sharedApplication.windows) {
+        if (other != w && other.windowLevel >= level) {
+            level = other.windowLevel + 1;
+        }
+    }
+    w.windowLevel = level;
+    [w makeKeyAndVisible];
+    [w.rootViewController loadViewIfNeeded];
+#if !TARGET_OS_VISION
+    if (scene != nil && !SohIos_SceneIsLandscape(scene)) {
+        if (@available(iOS 16.0, *)) {
+            UIWindowSceneGeometryPreferencesIOS* prefs = [[UIWindowSceneGeometryPreferencesIOS alloc]
+                initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+            [scene requestGeometryUpdateWithPreferences:prefs errorHandler:^(NSError* e) {
+                NSLog(@"[SohIosShell] onboarding landscape request failed: %@", e);
+            }];
+            [w.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+        }
+        for (int i = 0; i < 30 && !SohIos_SceneIsLandscape(scene); i++) {
+            [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        }
+    }
+#endif
+    SohIos_FitModalWindow(w, "ready");
+    NSLog(@"[SohIosShell] onboarding window ready %.0fx%.0f scene=%@", w.bounds.size.width, w.bounds.size.height,
+          scene ? NSStringFromCGRect(scene.coordinateSpace.bounds) : @"none");
+    return w;
+}
+
+// acceptTitle is the default button. cancelTitle == NULL → one button, returns 1.
+// Otherwise returns 1 for accept, 0 for cancel. Blocks the calling thread.
+int SohIos_AlertBlocking(const char* title, const char* message, const char* acceptTitle, const char* cancelTitle) {
+    if (![NSThread isMainThread]) {
+        __block int hopped = 0;
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            hopped = SohIos_AlertBlocking(title, message, acceptTitle, cancelTitle);
+        });
+        return hopped;
+    }
+    UIWindow* w = SohIos_MakeOnboardingWindow();
+    if (w == nil) {
+        return 0;
+    }
+    __block int result = -1;
+    NSString* t = title ? [NSString stringWithUTF8String:title] : @"";
+    NSString* m = message ? [NSString stringWithUTF8String:message] : @"";
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:t
+                                                               message:m
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    NSString* accept = acceptTitle ? [NSString stringWithUTF8String:acceptTitle] : @"OK";
+    [a addAction:[UIAlertAction actionWithTitle:accept
+                                          style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction* _) { result = 1; }]];
+    if (cancelTitle != NULL) {
+        [a addAction:[UIAlertAction actionWithTitle:[NSString stringWithUTF8String:cancelTitle]
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(UIAlertAction* _) { result = 0; }]];
+    }
+    [w.rootViewController presentViewController:a animated:NO completion:^{
+        NSLog(@"[SohIosShell] onboarding alert presented: %@", t);
+    }];
+    while (result < 0) {
+        SohIos_FitModalWindow(w, "alert");
+        [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+    }
+    w.hidden = YES;
+    return result;
 }
 
 // Nudge the scene to landscape if needed. Retries a few times since the scene
